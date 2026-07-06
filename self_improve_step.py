@@ -59,7 +59,7 @@ dataset = None
 diagnose_model = 'o1-2024-12-17'
 
 
-def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
+def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False, judge=False):
     """
     调用 o1 模型分析父代 agent 的运行日志，生成改进问题陈述（problem_statement）。
 
@@ -72,20 +72,28 @@ def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attem
       失败时返回 None，让调用方决定如何处理（通常会跳过本次改进）。
 
     Args:
-        entry (str): SWE-bench 任务 ID 或特殊值（'solve_empty_patches' 等）。
+        entry (str): SWE-bench 任务 ID 或 judge 模式的固定值（'improve_judge'）。
         commit (str): 父代 agent 的版本 commit hash。
         root_dir (str): DGM 根目录（/dgm/）。
         out_dir (str): 父代评估结果目录（用于读取运行日志）。
         patch_files (list[str]): 父代所有 patch 文件路径列表（用于在代码读取时叠加）。
         max_attempts (int): 最大重试次数，默认 3。
         polyglot (bool): 是否为 Polyglot 模式。
+        judge (bool): 是否为 judge 模式（使用 get_diagnose_prompt_judge，Step 5 实现）。
 
     Returns:
         str | None: 格式化的改进问题陈述（包含 agent 架构说明 + 具体改进任务），
                     或 None（重试耗尽后返回）。
     """
     client = create_client(diagnose_model)
-    if polyglot:
+    if judge:
+        # judge 模式：使用 judge 专属诊断 prompt（Step 5 中实现 get_diagnose_prompt_judge）
+        # 该 prompt 分析 eval_result.json 中的误判样本，引导 o1 改进 judge/prompts.py
+        from prompts.self_improvement_prompt import get_diagnose_prompt_judge
+        diagnose_sys_message, diagnose_prompt = get_diagnose_prompt_judge(
+            commit, root_dir, out_dir, patch_files,
+        )
+    elif polyglot:
         diagnose_sys_message, diagnose_prompt = get_diagnose_prompt_polyglot(
             entry, commit, root_dir, out_dir, dataset,
             patch_files=patch_files,
@@ -107,7 +115,15 @@ def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attem
         safe_log(f"Message history: {msg_history}")
         response_json = extract_json_between_markers(response)
         assert response_json, "empty response json"
-        problem_statement = get_problem_description_prompt(response_json, polyglot)
+        # Bug 2 修复：judge 模式下使用 judge 专属的任务指令构建函数
+        # 原版 get_problem_description_prompt 前缀 coding_agent_summary（SWE agent 描述），
+        # 会误导 coding_agent 以为要修改自己的代码，而非 judge/ 目录。
+        # 改为根据 judge 参数分支，judge 模式使用 get_judge_problem_description_prompt。
+        if judge:
+            from prompts.self_improvement_prompt import get_judge_problem_description_prompt
+            problem_statement = get_judge_problem_description_prompt(response_json)
+        else:
+            problem_statement = get_problem_description_prompt(response_json, polyglot)
     except Exception as e:
         safe_log(f"Error while diagnosing the problem: {e}")
         if max_attempts > 0:
@@ -116,6 +132,7 @@ def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attem
                 patch_files=patch_files,
                 max_attempts=max_attempts-1,
                 polyglot=polyglot,
+                judge=judge,
             )
         else:
             return None
@@ -348,6 +365,126 @@ def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, outp
         safe_log("End of evaluation more")
 
 
+def _run_evaluate_in_container(container, data_path_host, output_dir, env_vars):
+    """
+    在 DGM 容器内运行 evaluate.py，返回解析后的 eval_result dict 或 None。
+
+    内部辅助函数，供 run_harness_judge 调用。
+    独立抽取是为了让两阶段评估（小集→大集）可以复用相同逻辑，
+    避免在 run_harness_judge 中重复 copy/exec/parse 代码。
+    """
+    data_filename = os.path.basename(data_path_host)
+    container_data_path = f"/dgm/data/{data_filename}"
+    container_result_path = f"/dgm/data/eval_result_{data_filename}.json"
+
+    # 确保容器内 data/ 目录存在（Docker 镜像中可能没有，因为是 Step 1 才生成的）
+    container.exec_run("mkdir -p /dgm/data", workdir="/")
+    copy_to_container(container, data_path_host, container_data_path)
+
+    cmd = [
+        "python", "/dgm/evaluate.py",
+        "--data", container_data_path,
+        "--output", container_result_path,
+    ]
+    exec_result = container.exec_run(cmd, environment=env_vars, workdir="/dgm")
+    log_container_output(exec_result)
+
+    # 把结果文件取回 host
+    result_host_path = os.path.join(output_dir, f"eval_result_{data_filename}.json")
+    try:
+        copy_from_container(container, container_result_path, result_host_path)
+        with open(result_host_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        safe_log(f"[judge] 无法读取评估结果: {e}")
+        return None
+
+
+def run_harness_judge(
+    model_name_or_path, patch_files, output_dir, metadata,
+    data_path_small, test_more_threshold=None, data_path_more=None,
+):
+    """
+    Judge 模式的评估函数：在 DGM 容器内运行 evaluate.py，测量 rigor_bucket 判断准确率。
+
+    与 run_harness_swe / run_harness_polyglot 的关键差异：
+      - 不需要 per-sample 的 SWE-bench Docker 容器，整个评估在一个 DGM 容器内完成
+      - judge 代码（judge/ 目录）已通过 patch_files 打入容器，evaluate.py 直接调用它
+      - 两阶段结构（小集→大集）与原版两阶段 SWE 评估对应：
+          阶段一：data_path_small（50条）—— 快速淘汰低质量改动
+          阶段二：data_path_more（200条）—— 仅当阶段一 accuracy >= test_more_threshold 时触发
+
+    Args:
+        model_name_or_path (str): 本次 run_id（用于容器命名，避免冲突）。
+        patch_files (list[str]): 父代到本代的完整 patch 链（已包含本次 model_patch.diff）。
+        output_dir (str): 本次 run 的输出目录（eval_result*.json 写入此目录）。
+        metadata (dict): 元数据 dict，函数会更新其中的 overall_performance 字段。
+        data_path_small (str): 阶段一数据文件路径（host 侧，50条训练集子集）。
+        test_more_threshold (float | None): 触发阶段二的 accuracy 阈值（None 表示不做阶段二）。
+        data_path_more (str | None): 阶段二数据文件路径（host 侧，200条训练集子集）。
+    """
+    safe_log('Start judge harness')
+
+    # 创建一个新的 DGM 容器来运行 judge 评估
+    # 理由：容器在 self_improve 的 coding_agent 执行后已被 cleanup，
+    # 此处重新创建一个，apply patch chain，得到打了补丁的 judge/ 代码
+    root_dir = os.path.abspath('./')
+    docker_client = docker.from_env()
+    container_name = f"dgm-judge-{model_name_or_path}"
+    remove_existing_container(docker_client, container_name)
+    container = build_dgm_container(
+        docker_client, root_dir, "dgm", container_name, force_rebuild=False
+    )
+    container.start()
+
+    # 按顺序 apply patch chain，将父代到本代的所有代码变更重现到容器中
+    # （与 self_improve 主流程中 apply patch 的逻辑一致）
+    for patch_file in patch_files:
+        copy_to_container(container, patch_file, '/dgm/parent_patch.txt')
+        exec_result = container.exec_run("/bin/sh -c 'patch -p1 < /dgm/parent_patch.txt'", workdir='/dgm')
+        log_container_output(exec_result)
+        exec_result = container.exec_run("rm /dgm/parent_patch.txt", workdir='/dgm')
+        log_container_output(exec_result)
+
+    # 环境变量：只传 LLM 调用所需的凭证（ANTHROPIC_API_KEY 不传，因为使用 Bedrock）
+    env_vars = {
+        "AWS_REGION": os.getenv('AWS_REGION'),
+        "AWS_REGION_NAME": os.getenv('AWS_REGION_NAME'),
+        "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
+        "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
+        "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
+    }
+
+    # 阶段一：在小集合（50条）上评估，快速筛选
+    safe_log(f'[judge] 阶段一评估：{data_path_small}')
+    result = _run_evaluate_in_container(container, data_path_small, output_dir, env_vars)
+    if result:
+        metadata['overall_performance'] = result.get('overall_performance', {})
+        safe_log(f"[judge] 阶段一结果：{metadata['overall_performance']}")
+    else:
+        metadata['overall_performance'] = {}
+
+    # 阶段二：accuracy 超过阈值时，在更大集合（200条）上做完整评估
+    # 类比 run_harness_swe 的 test_more_threshold 逻辑：
+    # 大多数改动不会显著提升性能，只有表现良好的才值得花更多资源验证
+    phase1_accuracy = metadata.get('overall_performance', {}).get('accuracy_score')
+    if (
+        test_more_threshold is not None
+        and data_path_more is not None
+        and phase1_accuracy is not None
+        and phase1_accuracy >= test_more_threshold
+    ):
+        safe_log(f'[judge] 阶段二评估（accuracy={phase1_accuracy:.3f} >= {test_more_threshold}）：{data_path_more}')
+        result_more = _run_evaluate_in_container(container, data_path_more, output_dir, env_vars)
+        if result_more:
+            # 阶段二结果覆盖 overall_performance（与 run_harness_swe 行为一致）
+            metadata['overall_performance'] = result_more.get('overall_performance', {})
+            safe_log(f"[judge] 阶段二结果：{metadata['overall_performance']}")
+
+    cleanup_container(container)
+    safe_log("End of judge evaluation")
+
+
 def self_improve(
     parent_commit='initial',  # 'initial' 表示从原始版本开始，否则为父代的 run_id
     output_dir='output_selfimprove/',
@@ -362,7 +499,14 @@ def self_improve(
     full_eval_threshold=None,
     # 基线对比参数
     run_baseline=None,
-    polyglot=False
+    polyglot=False,
+    # ── judge 模式新增参数 ──────────────────────────────────────────────────
+    # judge=True 时：不再评估 SWE-bench issue 解决率，而是评估 rigor_bucket 判断准确率
+    # 评估函数从 run_harness_swe 切换为 run_harness_judge
+    judge=False,
+    judge_data_small=None,    # 阶段一数据路径（50条训练集子集，快速迭代筛选）
+    judge_data_medium=None,   # 阶段二数据路径（200条训练集子集，晋升验证，None=不做阶段二）
+    judge_test_more_threshold=0.5,  # 触发阶段二的 accuracy 阈值（默认 0.5）
 ):
     """
     执行一次完整的 DGM 自改进步骤：诊断问题 → 修改代码 → 评估效果。
@@ -414,8 +558,11 @@ def self_improve(
         dict: 本次自改进的元数据（包含评估结果、改进诊断等）。
     """
     global dataset
-    # 加载数据集（Polyglot 从本地 JSON，SWE-bench 从 HuggingFace）
-    if polyglot:
+    # judge 模式不需要 SWE-bench 或 Polyglot 数据集，跳过 HuggingFace 加载
+    # SWE/Polyglot 模式才需要 dataset（传给 diagnose_problem 以读取运行日志）
+    if judge:
+        dataset = None  # judge 模式下 diagnose_problem 使用 get_diagnose_prompt_judge，不依赖 dataset
+    elif polyglot:
         with open("polyglot/polyglot_benchmark_metadata.json") as f:
             dataset = json.loads(f.read())
     else:
@@ -431,8 +578,8 @@ def self_improve(
     os.makedirs(output_dir, exist_ok=True)
     metadata['run_id'] = run_id
     metadata['parent_commit'] = parent_commit
-    # 预加载大任务列表（用于 full eval，当前传给 run_harness 但未实现完整功能）
-    test_task_list_big = load_json_file("./swe_bench/subsets/big.json")
+    # 预加载大任务列表（judge 模式不需要此变量，仅 SWE 模式使用）
+    test_task_list_big = None if judge else load_json_file("./swe_bench/subsets/big.json")
 
     logger = setup_logger(os.path.join(output_dir, "self_improve.log"))
 
@@ -491,9 +638,13 @@ def self_improve(
     log_container_output(exec_result)
 
     # 调用 diagnose_problem：让 o1 分析日志，生成改进任务描述
+    # judge 模式传入 judge=True，diagnose_problem 会调用 get_diagnose_prompt_judge（Step 5 实现）
     if entry:
         safe_log(f"Task to improve: {entry}")
-        problem_statement = diagnose_problem(entry, parent_commit, root_dir, out_dir_base, patch_files=patch_files, polyglot=polyglot)
+        problem_statement = diagnose_problem(
+            entry, parent_commit, root_dir, out_dir_base,
+            patch_files=patch_files, polyglot=polyglot, judge=judge,
+        )
         safe_log(f"problem_statement: {problem_statement}")
     else:
         safe_log("No entry provided. Exiting.")
@@ -511,9 +662,16 @@ def self_improve(
 
     # 在容器中运行 coding_agent.py --self_improve
     # agent 会读取 problem_statement，然后修改 /dgm/ 中的代码文件
+    # judge 模式：agent 修改 /dgm/judge/ 目录下的代码（prompt、scorer 等）
+    # SWE/Polyglot 模式：agent 修改自身逻辑（coding_agent.py 等）
     safe_log("Running self-improvement")
     chat_history_file_container = "/dgm/self_evo.md"
-    test_description = get_test_description(swerepo=False)  # 自改进时不是修复 SWE issue
+    if judge:
+        # judge 模式告诉 agent：改进目标是 judge/ workflow，验证方式是 evaluate.py
+        # 这替换了原版的 pytest/SWE-bench 测试描述
+        test_description = "run `python /dgm/evaluate.py --data /dgm/data/soundnessbench_train_small.jsonl` to test your changes to the judge workflow"
+    else:
+        test_description = get_test_description(swerepo=False)  # 自改进时不是修复 SWE issue
     env_vars = {
         "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
         "AWS_REGION": os.getenv('AWS_REGION'),
@@ -572,7 +730,19 @@ def self_improve(
     model_name_or_path = run_id
     if model_patch_exists and model_patch_notempty:
         try:
-            if not polyglot:
+            if judge:
+                # judge 模式：评估 rigor_bucket 准确率，不需要 SWE-bench 容器
+                # judge_data_small 默认回退到 DEFAULT_DATA（train_small.jsonl）
+                _data_small = judge_data_small or os.path.join(
+                    os.path.abspath('./'), "data", "soundnessbench_train_small.jsonl"
+                )
+                run_harness_judge(
+                    model_name_or_path, patch_files, output_dir, metadata,
+                    data_path_small=_data_small,
+                    test_more_threshold=judge_test_more_threshold,
+                    data_path_more=judge_data_medium,
+                )
+            elif not polyglot:
                 run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more)
             else:
                 run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more)
@@ -582,19 +752,27 @@ def self_improve(
     # 可选：评估后诊断（让 o1 分析改进是否真的有效）
     if post_improve_diagnose:
         safe_log("Diagnosing the self-improvement")
-        metadata['is_compiled'] = is_compiled_self_improve(metadata)
-        if metadata['is_compiled']:
-            safe_log("The self-improvement succeed to be complied")
-            improvement_diagnosis = diagnose_improvement(
-                entry, parent_commit, root_dir,
-                model_patch_file, out_dir_base, run_id,
-                patch_files=patch_files,
-            )
-            metadata['improvement_diagnosis'] = improvement_diagnosis
-            safe_log(f"Improvement diagnosis: {improvement_diagnosis}")
+        if judge:
+            # judge 模式：is_compiled 的语义改为"评估是否产出了有效的 accuracy_score"
+            # 不调用 diagnose_improvement，因为它依赖 SWE-bench 的运行日志格式
+            # Step 6 的 filter_compiled 会读这个字段，所以必须写入
+            perf = metadata.get('overall_performance', {})
+            metadata['is_compiled'] = perf.get('accuracy_score') is not None
+            safe_log(f"[judge] is_compiled={metadata['is_compiled']}, accuracy={perf.get('accuracy_score')}")
         else:
-            safe_log("The self-improvement fail to be complied")
-            metadata['improvement_diagnosis'] = "Fail to complied. Ignore this."
+            metadata['is_compiled'] = is_compiled_self_improve(metadata)
+            if metadata['is_compiled']:
+                safe_log("The self-improvement succeed to be complied")
+                improvement_diagnosis = diagnose_improvement(
+                    entry, parent_commit, root_dir,
+                    model_patch_file, out_dir_base, run_id,
+                    patch_files=patch_files,
+                )
+                metadata['improvement_diagnosis'] = improvement_diagnosis
+                safe_log(f"Improvement diagnosis: {improvement_diagnosis}")
+            else:
+                safe_log("The self-improvement fail to be complied")
+                metadata['improvement_diagnosis'] = "Fail to complied. Ignore this."
 
     save_metadata(metadata, output_dir)
     return metadata
@@ -618,6 +796,13 @@ def main():
     parser.add_argument('--no_post_improve_diagnose', default=False, action='store_true')
     parser.add_argument('--entry', default="django__django-10999", type=str)
     parser.add_argument('--test_task_list', default=None, type=str)
+    # judge 模式参数：--judge 开启后，切换到 rigor_bucket 评估
+    parser.add_argument('--judge', default=False, action='store_true',
+                        help='启用 judge 模式：评估 rigor_bucket 准确率而非 SWE-bench 解决率')
+    parser.add_argument('--judge_data_small', default=None, type=str,
+                        help='judge 阶段一数据路径（默认：data/soundnessbench_train_small.jsonl）')
+    parser.add_argument('--judge_data_medium', default=None, type=str,
+                        help='judge 阶段二数据路径（None=不做阶段二）')
     args = parser.parse_args()
 
     # 将初始版本的评估结果复制到工作目录（self_improve 依赖这些结果）
@@ -631,6 +816,9 @@ def main():
         post_improve_diagnose=not args.no_post_improve_diagnose,
         entry=args.entry,
         test_task_list=args.test_task_list,
+        judge=args.judge,
+        judge_data_small=args.judge_data_small,
+        judge_data_medium=args.judge_data_medium,
     )
 
 

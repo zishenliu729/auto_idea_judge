@@ -1,3 +1,4 @@
+import glob
 import os
 import json
 
@@ -9,15 +10,21 @@ from utils.common_utils import load_json_file, read_file
 # 自改进诊断提示词模块——DGM 中"识别问题、生成改进方案"的核心提示词库。
 #
 # 工作流程（在 self_improve_step.py 中被调用）：
-#   1. o1 模型接收 system_message（含当前 agent 代码）+ user prompt（含运行日志）
+#   1. o1 模型接收 system_message（含当前 agent/judge 代码）+ user prompt（含运行日志/误判样本）
 #   2. 返回 JSON，包含 log_summarization / potential_improvements /
 #      improvement_proposal / implementation_suggestion / problem_description
 #   3. problem_description 被格式化为 coding_agent 的任务指令（problem_statement）
-#   4. coding_agent 按指令修改自己的代码，生成 model_patch
+#   4. coding_agent 按指令修改代码，生成 model_patch
 #
 # 与 diagnose_improvement_prompt.py 的关系：
 #   - 本文件：诊断"问题是什么"（改进前分析，生成改进方案）
 #   - diagnose_improvement_prompt.py：评估"改进是否有效"（改进后回顾分析）
+#
+# Step 5 新增 judge 模式支持：
+#   - judge_agent_summary：描述 judge/ workflow 架构（替代 coding_agent_summary）
+#   - judge_diagnose_system_message / judge_diagnose_prompt：judge 专属 prompt 模板
+#   - get_diagnose_prompt_judge：构建 judge 模式的 (system_message, user_prompt) 对
+#   - get_judge_problem_description_prompt：将 o1 诊断 JSON 转化为 coding_agent 任务指令
 # ============================================================
 
 
@@ -683,3 +690,262 @@ def get_current_code(current_dir, code_files, patch_files=None, exclude_files=No
             code_text.append(read_file(patch_file))
 
     return "\n".join(code_text)
+
+
+# ============================================================
+# ── Judge 模式专属 prompt（Step 5 新增）────────────────────
+#
+# 对应关系：
+#   coding_agent_summary         → judge_agent_summary
+#   diagnose_system_message      → judge_diagnose_system_message
+#   diagnose_prompt              → judge_diagnose_prompt / judge_diagnose_prompt_no_eval
+#   get_problem_description_prompt → get_judge_problem_description_prompt
+#   get_diagnose_prompt_swe      → get_diagnose_prompt_judge
+# ============================================================
+
+# ── judge_agent_summary ────────────────────────────────────────────────────────
+# 作用：在 system_message 中向 o1 描述 judge/ workflow 的架构，
+# 让 o1 了解哪些文件可以修改、哪些是评估协议（不能动）。
+# 类比：coding_agent_summary 告诉 o1 coding_agent.py 的结构；
+#       judge_agent_summary 告诉 o1 judge/ 目录的结构。
+judge_agent_summary = """# Judge Workflow Summary
+
+The judge workflow classifies research proposals into rigor buckets ("low"/"high")
+based on their hypothesis and experiment description.
+
+- **Primary Optimization Target**: `judge/prompts.py`
+  - Contains SYSTEM_PROMPT and USER_TEMPLATE string constants for two evaluation modes:
+    - `direct_bucket`: balanced peer reviewer (the main mode, default target for improvement)
+    - `direct_bucket_aggressive`: strict area chair that defaults to "low"
+  - `build_scoring_prompt(hypothesis, experiment, mode)` formats these into (system_msg, user_msg) pairs
+  - This file is the most impactful to change — better prompts directly improve accuracy.
+
+- **Scoring Logic**: `judge/scorer.py`
+  - `score_pair(pair, client, client_model, mode)` calls the LLM and parses the JSON response
+  - `score_pairs_concurrent(pairs, model, mode, max_workers=8)` parallelizes scoring
+  - `_parse_prediction(response)` extracts `{rigor_bucket, confidence, justification}` from LLM output
+  - Can be modified (e.g., adding chain-of-thought steps, adjusting parsing logic).
+
+- **Metrics**: `judge/metrics.py`
+  - `compute_bucket_metrics(predictions, ground_truths)` calculates accuracy and Cohen's kappa
+  - **Do NOT modify** — this defines the evaluation protocol.
+
+- **Entry Point**: `evaluate.py`
+  - Run with: `python evaluate.py --data data/soundnessbench_train_small.jsonl`
+  - Writes results to `eval_result.json` with `overall_performance.accuracy_score` as the main metric
+  - **Do NOT modify** — this is the fixed evaluation harness.
+
+- **Improvement Guidelines**:
+  - Focus on `judge/prompts.py`: improve how the judge characterizes "low" vs "high" rigor,
+    add explicit reasoning steps, or adjust the confidence scale description.
+  - Changes to `judge/scorer.py` (e.g., parsing robustness, temperature) are also valid.
+  - Do not install additional packages. Update `requirements.txt` if new dependencies are needed.
+  - Do not modify `evaluate.py` or `judge/metrics.py`.
+
+\n\n"""
+
+# ── judge_diagnose_system_message ────────────────────────────────────────────
+# 作用：包含当前 judge/ 代码，让 o1 了解待改进的实现细节。
+# 类比：diagnose_system_message 包含 coding_agent.py 的代码；
+#       judge_diagnose_system_message 包含 judge/ 目录的代码。
+judge_diagnose_system_message = """Here is the current implementation of the judge workflow.
+
+# Judge Workflow Implementation
+----- Judge Workflow Implementation Start -----
+{code}
+----- Judge Workflow Implementation End -----
+
+Your task is to identify ONE detailed plan that would improve the judge's ability to correctly
+classify research proposals into rigor buckets ("low" or "high").
+The improvement should generalize to new unseen examples, not just fix the specific misclassified samples.
+"""
+
+# ── judge_diagnose_prompt ──────────────────────────────────────────────────────
+# 作用：User prompt 模板，包含当前评估结果和误判样本，引导 o1 分析并提出改进方向。
+# 变量：{accuracy} {kappa} {total_n} {wrong_predictions}
+# 类比：diagnose_prompt 包含 agent 运行日志和测试结果；
+#       judge_diagnose_prompt 包含 evaluate.py 的评估指标和误判样本。
+judge_diagnose_prompt = """# Current Evaluation Results
+
+- Accuracy: {accuracy}
+- Cohen's Kappa: {kappa}
+- Total samples evaluated: {total_n}
+
+# Misclassified Samples
+The following research proposals were classified incorrectly by the current judge:
+
+{wrong_predictions}
+
+Respond precisely in the following format including the JSON start and end markers:
+
+```json
+<JSON>
+```
+
+In <JSON>, provide a JSON response with the following fields:
+- "log_summarization": Analyze the misclassified samples above. What patterns do you notice? What aspects of the hypothesis or experiment description seem to confuse the judge? Are there consistent failure modes (e.g., always predicts "high" for vague hypotheses, misses missing controls)?
+- "potential_improvements": Identify potential improvements to the judge workflow (primarily `judge/prompts.py`) that could improve classification accuracy. Focus on generalizable improvements, not memorizing the specific wrong examples.
+- "improvement_proposal": Choose ONE high-impact improvement from the identified potential improvements and describe it in detail. Be specific about what to change and why it would help.
+- "implementation_suggestion": Referring to the judge workflow summary and implementation above, describe exactly what changes should be made to which file(s). If editing `judge/prompts.py`, quote the specific section to change and what to replace it with.
+- "problem_description": Phrase the improvement proposal as a clear task for a software engineer. It should describe the problem (what the judge currently gets wrong), the proposed fix, and the expected outcome.
+
+Your response will be automatically parsed, so ensure that the string response is precisely in the correct format. Do NOT include the `<JSON>` tag in your output."""
+
+# ── judge_diagnose_prompt_no_eval ─────────────────────────────────────────────
+# 作用：当没有父代评估结果时（如初始轮次 parent_commit='initial'）使用的 prompt。
+# 此时无误判样本可分析，让 o1 基于对任务的理解提出通用改进方向。
+judge_diagnose_prompt_no_eval = """No evaluation results are available yet (this is the first improvement round).
+
+Review the current judge workflow implementation above and identify ONE improvement
+to the prompt or scoring logic that would improve its ability to correctly classify
+research proposals into rigor buckets ("low" for low-rigor, "high" for high-rigor).
+
+Focus on:
+- Whether the current prompt criteria for "low" vs "high" are clear and comprehensive
+- Whether the step-by-step reasoning is well-guided
+- Whether edge cases (vague hypotheses, partial methodologies) are handled
+
+Respond precisely in the following format including the JSON start and end markers:
+
+```json
+<JSON>
+```
+
+In <JSON>, provide a JSON response with the following fields:
+- "log_summarization": Analyze the current judge implementation. What are its potential weaknesses based on reading the prompt and scoring logic?
+- "potential_improvements": Identify potential improvements to the judge workflow that could improve classification accuracy in general.
+- "improvement_proposal": Choose ONE high-impact improvement and describe it in detail.
+- "implementation_suggestion": Describe exactly what changes to make to which file(s), with specific wording if editing `judge/prompts.py`.
+- "problem_description": Phrase the improvement as a clear task for a software engineer.
+
+Your response will be automatically parsed, so ensure that the string response is precisely in the correct format. Do NOT include the `<JSON>` tag in your output."""
+
+
+def get_judge_problem_description_prompt(response_json):
+    """将 o1 的诊断 JSON 转换为 coding_agent 的 judge 改进任务指令（problem_statement）。
+
+    与 get_problem_description_prompt 的区别：
+      - 前缀使用 judge_agent_summary（而非 coding_agent_summary），
+        让 coding_agent 知道它要修改的是 judge/ 目录，不是自己的代码
+      - 其余结构（implementation_suggestion + problem_description）与 SWE 版本一致
+
+    修复 Bug 2：diagnose_problem() 在 judge 模式下原本调用 get_problem_description_prompt,
+    该函数使用 coding_agent_summary 作为前缀，会误导 agent 以为要改自己的代码。
+    此函数改用 judge_agent_summary，正确引导 agent 改 judge/ 目录。
+    """
+    return judge_agent_summary + problem_description_prompt.format(
+        implementation_suggestion=response_json["implementation_suggestion"],
+        problem_description=response_json["problem_description"],
+    )
+
+
+def _format_wrong_predictions(results, max_examples=10):
+    """将 eval_result.json 中的误判样本格式化为可读文本（供 judge_diagnose_prompt 使用）。
+
+    只取前 max_examples 个误判样本，避免 prompt 过长超出 o1 上下文窗口。
+    justification 截断到 500 字符，去除了对诊断意义不大的过长推理过程。
+    """
+    wrong = [r for r in results if not r.get("correct", True)]
+    if not wrong:
+        return "(No misclassified samples found — accuracy may be 100%.)"
+    wrong = wrong[:max_examples]
+    parts = []
+    for i, r in enumerate(wrong, 1):
+        justification = r.get("justification") or "(none)"
+        if len(justification) > 500:
+            justification = justification[:500] + "...[truncated]"
+        parts.append(
+            f"--- Sample {i} ---\n"
+            f"Pair ID: {r.get('pair_id', 'N/A')}\n"
+            f"Ground Truth: {r.get('ground_truth', 'N/A')}\n"
+            f"Prediction:   {r.get('prediction', 'N/A')}\n"
+            f"Confidence:   {r.get('confidence', 'N/A')}\n"
+            f"Justification: {justification}"
+        )
+    total_wrong = len([r for r in results if not r.get("correct", True)])
+    header = f"Total misclassified: {total_wrong} (showing first {len(wrong)})\n\n"
+    return header + "\n\n".join(parts)
+
+
+def get_diagnose_prompt_judge(commit, root_dir, out_dir, patch_files):
+    """为 judge 模式构建诊断 prompt（system_message + user_prompt）。
+
+    类比 get_diagnose_prompt_swe，但面向 judge/ 目录而非 coding_agent.py：
+      - system_message：包含 judge/ 目录代码 + evaluate.py（让 o1 了解待改进的实现）
+      - user_prompt：包含父代的评估结果和误判样本（让 o1 分析失败模式）
+
+    父代 eval_result 的查找逻辑：
+      out_dir/{commit}/eval_result_*.json
+    对应 _run_evaluate_in_container 写入路径：
+      os.path.join(output_dir, f"eval_result_{data_filename}.json")
+    其中 output_dir = out_dir_base/{run_id}，commit 即 parent run_id。
+
+    特殊情况：commit='initial' 或无评估结果时，改用 judge_diagnose_prompt_no_eval，
+    让 o1 基于代码理解提出通用改进（而非依赖误判样本分析）。
+
+    Args:
+        commit (str): 父代版本标识（parent_commit，对应父代的 run_id 或 'initial'）。
+        root_dir (str): DGM 根目录（/dgm/），用于读取 judge/ 代码文件。
+        out_dir (str): 评估结果基础目录（out_dir_base），用于查找父代 eval_result.json。
+        patch_files (list[str]): 父代 patch 链（让 o1 了解相对初始版本的累积变化）。
+
+    Returns:
+        tuple[str, str]: (system_message, user_prompt)，可直接传给 get_response_from_llm。
+    """
+    # ── 构建 system_message（包含 judge/ 代码）──────────────────────────────
+    # 只包含 judge 相关代码：judge/ 目录 + evaluate.py
+    # 排除 judge/__init__.py（纯注释，无实现逻辑）
+    # 排除 self_improvement_prompt.py 等进化框架文件（与 judge 改进无关）
+    code_files = ["judge/", "evaluate.py"]
+    exclude_files = [
+        "judge/__init__.py",           # 纯注释文件，o1 读了也无帮助
+        "prompts/self_improvement_prompt.py",  # 本文件自身（避免循环引用）
+    ]
+    code_text = get_current_code(
+        root_dir, code_files, patch_files=patch_files, exclude_files=exclude_files
+    )
+    system_message = judge_agent_summary + judge_diagnose_system_message.format(code=code_text)
+
+    # ── 查找父代的 eval_result*.json ────────────────────────────────────────
+    # 路径：out_dir/{commit}/eval_result_*.json
+    # 注意：commit 是父代的 run_id（时间戳格式），对应 _run_evaluate_in_container 的写入目录
+    parent_dir = os.path.join(out_dir, commit)
+    eval_result_files = glob.glob(os.path.join(parent_dir, "eval_result_*.json"))
+
+    if not eval_result_files:
+        # 无父代评估结果（初始轮次或评估失败），改用通用改进 prompt
+        user_prompt = judge_diagnose_prompt_no_eval
+        return system_message, user_prompt
+
+    # 优先选 train_small 的结果（阶段一）；若有 train_medium 也优先使用（更多样本更可靠）
+    # 命名规则：eval_result_soundnessbench_train_small.jsonl.json / train_medium.jsonl.json
+    medium_files = [f for f in eval_result_files if "train_medium" in f]
+    small_files = [f for f in eval_result_files if "train_small" in f]
+    chosen_file = (medium_files or small_files or eval_result_files)[0]
+
+    try:
+        with open(chosen_file, encoding="utf-8") as f:
+            eval_data = json.load(f)
+    except Exception:
+        user_prompt = judge_diagnose_prompt_no_eval
+        return system_message, user_prompt
+
+    perf = eval_data.get("overall_performance", {})
+    accuracy = perf.get("accuracy_score")
+    kappa = perf.get("kappa")
+    total_n = perf.get("total_n", 0)
+
+    results = eval_data.get("results", [])
+    wrong_predictions_text = _format_wrong_predictions(results)
+
+    # 格式化准确率和 kappa，None 时显示 N/A
+    accuracy_str = f"{accuracy:.4f}" if accuracy is not None else "N/A"
+    kappa_str = f"{kappa:.4f}" if kappa is not None else "N/A"
+
+    user_prompt = judge_diagnose_prompt.format(
+        accuracy=accuracy_str,
+        kappa=kappa_str,
+        total_n=total_n,
+        wrong_predictions=wrong_predictions_text,
+    )
+    return system_message, user_prompt

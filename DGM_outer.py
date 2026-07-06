@@ -46,7 +46,7 @@ from utils.evo_utils import load_dgm_metadata, is_compiled_self_improve
 # ============================================================
 
 
-def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
+def initialize_run(output_dir, prevrun_dir=None, polyglot=False, judge=False):
     """
     初始化或恢复 DGM 运行（设置 archive 和起始代数）。
 
@@ -62,13 +62,14 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
          - 适用于意外中断后的断点续跑
 
     initial_folder_name 区分：
-      'initial'（SWE-bench）vs 'initial_polyglot'（Polyglot），
-      两个基准测试有各自的初始评估结果。
+      'initial'（SWE-bench）vs 'initial_polyglot'（Polyglot）vs 'initial_judge'（judge 模式），
+      三个模式各自的初始评估结果格式不同，用不同目录名避免混淆。
 
     Args:
         output_dir (str): 本次 DGM run 的输出目录。
         prevrun_dir (str | None): 上次运行的目录（恢复时传入）。
         polyglot (bool): 是否为 Polyglot 模式。
+        judge (bool): 是否为 judge 模式。
 
     Returns:
         tuple[list, int]: (archive, start_gen_num)
@@ -83,9 +84,19 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
         archive = metadata['archive']
         start_gen_num = metadata['generation'] + 1
 
-    initial_folder_name = 'initial' if not polyglot else 'initial_polyglot'
+    # judge 模式使用独立的初始目录，避免与 SWE/Polyglot 的初始评估混淆
+    # initial_judge/ 需要在运行 DGM 前预先生成（运行一次 evaluate.py 得到初始 accuracy）
+    if judge:
+        initial_folder_name = 'initial_judge'
+    elif polyglot:
+        initial_folder_name = 'initial_polyglot'
+    else:
+        initial_folder_name = 'initial'
+
     # 若未恢复已有运行且初始目录不存在，则从预置目录复制
-    if not prevrun_dir and not os.path.exists(f"{output_dir}/{initial_folder_name}"):
+    # 始终检查 output_dir/initial（archive key 固定为 'initial'），
+    # 而非 output_dir/{initial_folder_name}——两者不同时会导致每次都重复覆盖
+    if not prevrun_dir and not os.path.exists(os.path.join(output_dir, "initial")):
         if os.path.exists(initial_folder_name):
             os.system(f"cp -r {initial_folder_name}/ {output_dir}/initial")
         else:
@@ -123,22 +134,23 @@ def any_exceeding_context_length(output_dir, commit_id, instance_ids):
     return False
 
 
-def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', run_baseline=None, polyglot=False):
+def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', run_baseline=None, polyglot=False, judge=False):
     """
     为当前代选择自改进尝试：(父代 commit, 改进任务) 的列表。
 
     父代选择（candidates 构建）：
       读取每个 archive 成员的 metadata.json，提取：
-      - accuracy_score：当前版本的解决率（主要性能指标）
-      - total_unresolved_ids：未解决的 issue 列表（改进的主要目标）
-      - total_emptypatch_ids：生成了空 patch 的 issue 列表
+      - accuracy_score：当前版本的解决率（主要性能指标，SWE/judge 通用）
+      - total_unresolved_ids：未解决的 issue 列表（仅 SWE/Polyglot 模式）
+      - total_emptypatch_ids：生成了空 patch 的 issue 列表（仅 SWE/Polyglot 模式）
       - children_count：该版本已有多少子代版本（影响 score_child_prop）
 
-    注意：children_count 的累积方式——遍历 archive 中所有非 'initial' 的版本，
-    读取其 parent_commit，将父代的 children_count 加 1。
-    这保证了 children_count 是从已有 archive 状态实时计算的。
+    judge 模式的简化：
+      - candidates 只读取 accuracy_score 和 children_count，无 SWE 专属字段
+      - entry 固定为 'improve_judge'（不需要选具体 issue，改进目标是整体准确率）
+      - 父代选择策略（score_prop、score_child_prop 等）与 SWE 模式相同
 
-    SWE-bench 任务选择的特殊逻辑（Polyglot 不适用）：
+    SWE-bench 任务选择的特殊逻辑（Polyglot/judge 不适用）：
       按优先级依次尝试（使用 continue 跳过后续判断）：
       1. 如果空 patch 比例 >= 10% AND 随机数 < 0.25 → 选 solve_empty_patches
       2. 如果随机数 < 0.25 → 选 solve_stochasticity
@@ -152,6 +164,7 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
         method (str): 父代选择方法。
         run_baseline (str | None): 基线模式（'no_darwin' 时强制选最后一个版本）。
         polyglot (bool): 是否为 Polyglot 模式。
+        judge (bool): 是否为 judge 模式。
 
     Returns:
         list[tuple[str, str]]: [(parent_commit, entry_id), ...] 的列表，
@@ -165,13 +178,21 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
         try:
             metadata_path = os.path.join(output_dir, commit, "metadata.json")
             metadata = load_json_file(metadata_path)
-            candidates[commit] = {
-                'accuracy_score': metadata['overall_performance']['accuracy_score'],
-                'total_unresolved_ids': metadata['overall_performance']['total_unresolved_ids'],
-                'total_emptypatch_ids': metadata['overall_performance']['total_emptypatch_ids'],
-                'total_resolved_ids': metadata['overall_performance']['total_resolved_ids'],
-                'children_count': 0,  # 初始为 0，后续累积
-            }
+            if judge:
+                # judge 模式：overall_performance 只有 {accuracy_score, kappa, total_n}
+                # 不读取 SWE 专属字段（total_unresolved_ids 等），避免 KeyError
+                candidates[commit] = {
+                    'accuracy_score': metadata['overall_performance']['accuracy_score'],
+                    'children_count': 0,
+                }
+            else:
+                candidates[commit] = {
+                    'accuracy_score': metadata['overall_performance']['accuracy_score'],
+                    'total_unresolved_ids': metadata['overall_performance']['total_unresolved_ids'],
+                    'total_emptypatch_ids': metadata['overall_performance']['total_emptypatch_ids'],
+                    'total_resolved_ids': metadata['overall_performance']['total_resolved_ids'],
+                    'children_count': 0,  # 初始为 0，后续累积
+                }
             # 累积父代的 children_count（自身排除 'initial'，避免键不存在）
             if commit != 'initial':
                 parent_commit = metadata['parent_commit']
@@ -218,6 +239,12 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
 
     # 为每个选中的父代确定改进任务
     for parent_commit in parent_commits:
+        if judge:
+            # judge 模式：任务固定为 'improve_judge'（无需选具体 issue，目标是整体准确率）
+            # 每次改进都是针对 judge/ workflow 的整体优化，不区分单个失败样本
+            selfimprove_entries.append((parent_commit, 'improve_judge'))
+            continue
+
         empty_ids = candidates[parent_commit]['total_emptypatch_ids']
         resolved_ids = candidates[parent_commit]['total_resolved_ids']
         unresolved_ids = candidates[parent_commit]['total_unresolved_ids']
@@ -262,14 +289,19 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
     return selfimprove_entries
 
 
-def filter_compiled(run_ids, output_dir, num_swe_issues=[], logger=None):
+def filter_compiled(run_ids, output_dir, num_swe_issues=[], logger=None, judge=False):
     """
     过滤掉未通过"编译"验证的自改进结果。
 
-    "编译"的宽泛含义（is_compiled_self_improve 的判断标准）：
+    SWE/Polyglot 模式的"编译"含义（is_compiled_self_improve 的判断标准）：
       1. metadata 中存在必要的键（patch 文件、评估结果等）
       2. resolved + unresolved > 0（成功运行了评估）
       3. total_submitted >= num_swe_issues 阈值（评估任务数量足够）
+
+    judge 模式的简化：
+      is_compiled 字段由 self_improve_step.py 在 post_improve_diagnose 块中写入
+      （Step 4 Bug 1 修复），语义为"evaluate.py 是否产出了有效的 accuracy_score"。
+      直接读取该字段，不调用 is_compiled_self_improve（含 SWE 专属字段检查）。
 
     只有通过验证的版本才会被加入 archive，
     这防止了崩溃、编译错误、空 patch 等情况污染档案库。
@@ -277,8 +309,9 @@ def filter_compiled(run_ids, output_dir, num_swe_issues=[], logger=None):
     Args:
         run_ids (list[str]): 本代所有自改进结果的 run_id 列表。
         output_dir (str): DGM run 的输出目录。
-        num_swe_issues (list[int]): 期望的评估任务数量（用于验证完整性）。
+        num_swe_issues (list[int]): 期望的评估任务数量（用于验证完整性，仅 SWE 模式使用）。
         logger: 日志器实例。
+        judge (bool): 是否为 judge 模式。
 
     Returns:
         list[str]: 通过验证的 run_id 列表（可以加入 archive）。
@@ -290,8 +323,14 @@ def filter_compiled(run_ids, output_dir, num_swe_issues=[], logger=None):
         metadata_path = os.path.join(output_dir, run_id, "metadata.json")
         metadata = load_json_file(metadata_path)
         logger.info(f"{run_id} metadata: {metadata}")
-        if is_compiled_self_improve(metadata, num_swe_issues=num_swe_issues, logger=logger):
-            run_ids_compiled.append(run_id)
+        if judge:
+            # judge 模式：直接读取 is_compiled 字段（由 Step 4 的 post_improve_diagnose 块写入）
+            # 不调用 is_compiled_self_improve，避免该函数检查 SWE 专属字段时 KeyError
+            if metadata.get('is_compiled', False):
+                run_ids_compiled.append(run_id)
+        else:
+            if is_compiled_self_improve(metadata, num_swe_issues=num_swe_issues, logger=logger):
+                run_ids_compiled.append(run_id)
     return run_ids_compiled
 
 
@@ -449,6 +488,16 @@ def main():
     parser.add_argument("--eval_noise", type=float, default=0.1)
     parser.add_argument("--no_full_eval", default=False, action='store_true')
     parser.add_argument("--run_baseline", type=str, default=None, choices=['no_selfimprove', 'no_darwin'])
+    # ── judge 模式参数（Step 6 新增）────────────────────────────────────────
+    # --judge：启用 judge 模式，跳过 SWE 评估，改为跑 evaluate.py 测量 rigor_bucket 准确率
+    # --judge_data_small/medium：传给 self_improve() 的 judge 数据路径
+    #   默认 None 时 self_improve_step.py 会使用 DEFAULT_DATA（train_small.jsonl）
+    parser.add_argument("--judge", default=False, action='store_true',
+                        help='启用 judge 模式：评估 rigor_bucket 准确率而非 SWE-bench 解决率')
+    parser.add_argument("--judge_data_small", default=None, type=str,
+                        help='judge 阶段一数据路径（默认：data/soundnessbench_train_small.jsonl）')
+    parser.add_argument("--judge_data_medium", default=None, type=str,
+                        help='judge 阶段二数据路径（None=不做阶段二）')
     args = parser.parse_args()
 
     # 确定本次运行的 ID（新运行 = 时间戳，恢复运行 = 上次的 ID）
@@ -461,10 +510,16 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # 初始化 archive 和起始代数
-    archive, start_gen_num = initialize_run(output_dir, prevrun_dir=args.continue_from, polyglot=args.polyglot)
+    archive, start_gen_num = initialize_run(
+        output_dir, prevrun_dir=args.continue_from, polyglot=args.polyglot, judge=args.judge,
+    )
 
     # 加载评估子集（small=12, medium=50 个 issue）
-    if not args.polyglot:
+    # judge 模式不依赖 SWE/Polyglot 子集，数据路径通过 --judge_data_small/medium 传入
+    if args.judge:
+        swe_issues_sm = []
+        swe_issues_med = []
+    elif not args.polyglot:
         swe_issues_sm = load_json_file("./swe_bench/subsets/small.json")
         swe_issues_med = load_json_file("./swe_bench/subsets/medium.json")
     else:
@@ -486,6 +541,7 @@ def main():
             method=args.choose_selfimproves_method,
             run_baseline=args.run_baseline,
             polyglot=args.polyglot,
+            judge=args.judge,
         )
         logger.info(f"Self-improve entries for generation {gen_num}: {selfimprove_entries}")
 
@@ -501,12 +557,17 @@ def main():
                     num_evals=args.num_swe_evals,
                     post_improve_diagnose=args.post_improve_diagnose,
                     entry=entry,
-                    test_task_list=swe_issues_sm,
-                    test_more_threshold=None if args.shallow_eval else test_more_threshold,
-                    test_task_list_more=None if args.shallow_eval else swe_issues_med,
+                    test_task_list=None if args.judge else swe_issues_sm,
+                    test_more_threshold=None if (args.shallow_eval or args.judge) else test_more_threshold,
+                    test_task_list_more=None if (args.shallow_eval or args.judge) else swe_issues_med,
                     polyglot=args.polyglot,
-                    full_eval_threshold=None if args.no_full_eval else get_full_eval_threshold(output_dir, archive),
+                    # judge 模式不做全量评估（get_full_eval_threshold 依赖 SWE 专属字段）
+                    full_eval_threshold=None if (args.no_full_eval or args.judge) else get_full_eval_threshold(output_dir, archive),
                     run_baseline=args.run_baseline,
+                    # judge 模式新增参数：传入 judge 标志和数据路径
+                    judge=args.judge,
+                    judge_data_small=args.judge_data_small if args.judge else None,
+                    judge_data_medium=args.judge_data_medium if args.judge else None,
                 )
                 for parent_commit, entry in selfimprove_entries
             ]
@@ -530,9 +591,12 @@ def main():
         selfimprove_ids_compiled = filter_compiled(
             selfimprove_ids,
             output_dir,
-            # shallow_eval 只用 small 子集；否则需要通过 small 和 medium 两个阶段
-            num_swe_issues=[len(swe_issues_sm)] if args.shallow_eval else [len(swe_issues_sm), len(swe_issues_med)],
-            logger=logger
+            # judge 模式不用 num_swe_issues 阈值（直接看 is_compiled 字段）
+            num_swe_issues=[] if args.judge else (
+                [len(swe_issues_sm)] if args.shallow_eval else [len(swe_issues_sm), len(swe_issues_med)]
+            ),
+            logger=logger,
+            judge=args.judge,
         )
 
         # 将通过验证的版本加入 archive
