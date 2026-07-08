@@ -63,6 +63,9 @@ AVAILABLE_LLMS = [
     "deepseek-chat",
     "deepseek-coder",
     "deepseek-reasoner",
+    # XHS MaaS Qwen judge backbone（OpenAI-compatible endpoint with api-key header）
+    "maas/Qwen3.5-397B-A17B-FP8",
+    "Qwen3.5-397B-A17B-FP8",
 ]
 
 
@@ -120,6 +123,24 @@ def create_client(model: str):
             base_url="https://api.deepseek.com"
         )
         return client, model
+    elif model.startswith("maas/") or model.startswith("Qwen3.5-"):
+        # Qwen judge backbone (2026-07-07): keep the final evaluator on a fixed
+        # open-source model via XHS MaaS. The secret stays outside code in MAAS_API_KEY.
+        client_model = model.split("/", 1)[1] if model.startswith("maas/") else model
+        base_url = os.getenv(
+            "MAAS_BASE_URL",
+            "https://maas.devops.xiaohongshu.com/dqaservice-cmtagent-397b/v1",
+        )
+        api_key = os.getenv("MAAS_API_KEY") or os.getenv("QWEN_API_KEY")
+        if not api_key:
+            raise ValueError("MAAS_API_KEY or QWEN_API_KEY is required for Qwen MaaS evaluation.")
+        print(f"Using XHS MaaS Qwen with model {client_model}.")
+        client = openai.OpenAI(
+            api_key="dummy",
+            base_url=base_url,
+            default_headers={"api-key": api_key},
+        )
+        return client, client_model
     elif model == "llama3.1-405b":
         print(f"Using OpenAI API with {model}.")
         client = openai.OpenAI(
@@ -363,6 +384,34 @@ def get_response_from_llm(
             stop=None,
         )
         content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif model.startswith("Qwen3.5-"):
+        # Qwen judge backbone (2026-07-07): thinking is intentionally enabled by
+        # default because SoundnessBench is a reasoning-heavy judge task. Keep a
+        # large enough token budget so reasoning_content does not crowd out content.
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        enable_thinking = os.getenv("MAAS_ENABLE_THINKING", "true").lower() not in {"0", "false", "no"}
+        max_tokens = int(os.getenv("MAAS_MAX_OUTPUT_TOKENS", "8192"))
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            n=1,
+            stop=None,
+            extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
+        )
+        message = response.choices[0].message
+        content = message.content
+        if content is None:
+            reasoning_tokens = getattr(response.usage, "reasoning_tokens", None)
+            raise ValueError(
+                "Qwen MaaS returned no final content. Increase MAAS_MAX_OUTPUT_TOKENS "
+                f"or set MAAS_ENABLE_THINKING=false. reasoning_tokens={reasoning_tokens}"
+            )
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif model in ["deepseek-reasoner"]:
         # DeepSeek-R1 推理模型：不需要温度参数，额外返回推理链（reasoning_content）

@@ -1,3 +1,4 @@
+import os
 import random
 from llm import create_client, extract_json_between_markers, get_response_from_llm
 from llm_withtools import convert_msg_history
@@ -5,6 +6,31 @@ from utils.swe_log_parsers import MAP_REPO_TO_PARSER
 
 
 # ============================================================
+
+
+DEFAULT_QWEN_MODEL = 'maas/Qwen3.5-397B-A17B-FP8'
+TIE_BREAKER_MODEL = os.getenv(
+    'DGM_TIE_BREAKER_MODEL',
+    os.getenv('DGM_OPENAI_MODEL', os.getenv('DGM_AGENT_MODEL', DEFAULT_QWEN_MODEL)),
+)
+
+
+def _message_text(msg):
+    """Return text from Claude-style blocks, Qwen strings, or OpenAI-style objects."""
+    content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                chunks.append(item.get('text') or item.get('content') or '')
+            else:
+                chunks.append(getattr(item, 'text', '') or getattr(item, 'content', ''))
+        return '\n'.join(chunk for chunk in chunks if chunk)
+    return str(content) if content is not None else ''
 # eval_utils.py
 # 评估相关的工具函数，供 swe_bench/harness.py 和 coding_agent.py 调用。
 #
@@ -81,8 +107,10 @@ def msg_history_to_report(instance_id, msg_history, model=None):
     # 从最新消息往前找包含工具结果的 user 消息
     for msg in reversed(msg_history):
         if msg['role'] == 'user':
-            # 取消息的第一个 content 块的文本内容
-            content = msg['content'][0]['text']
+            # Model switchboard (2026-07-08): Claude native tools store content as
+            # text blocks, while Qwen/manual-tools uses plain strings. Normalize here
+            # so switching DGM_AGENT_MODEL does not break regression-report parsing.
+            content = _message_text(msg)
             if 'Tool Result:' in content:
                 report = parse_eval_output(instance_id, content)
                 # 如果解析出了非空报告才返回（避免返回空报告误导评分）
@@ -141,8 +169,11 @@ def score_tie_breaker(problem_statement, code_diffs, test_reports, best_score_in
     # 默认回退值：取并列最优中的第一个
     best_score_index = best_score_indices[0]
     try:
-        # 使用推理能力更强的 o1 做裁判（claude-3-5-sonnet 善于工具调用，o1 善于深度推理）
-        client = create_client('o1-2024-12-17')
+        # Model switchboard (2026-07-08): the tie-breaker used to be hard-coded
+        # to OpenAI o1. Keep it configurable so smoke runs can use Qwen, and later
+        # comparative runs can set DGM_TIE_BREAKER_MODEL=o1/Claude as needed.
+        tie_breaker_model = os.getenv('DGM_TIE_BREAKER_MODEL', TIE_BREAKER_MODEL)
+        client = create_client(tie_breaker_model)
         # 构建每个候选方案的描述块（含 diff 和测试报告）
         proposed_solutions = [f'# Proposed solution {i+1}\n\n<code_diff_{i+1}>\n{code_diffs[index]}\n</code_diff{i+1}>\n<test_report_{i+1}>\n{test_reports[index]}\n</test_report_{i+1}>' for i, index in enumerate(best_score_indices)]
         proposed_solutions = '\n\n'.join(proposed_solutions)

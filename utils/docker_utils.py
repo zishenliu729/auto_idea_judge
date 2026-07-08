@@ -190,11 +190,19 @@ def build_dgm_container(
         docker.Container | None: 成功启动的容器对象；构建或启动失败时返回 None。
     """
     try:
-        # 判断是否需要构建：强制重建，或镜像列表中找不到同名 tag
-        if force_rebuild or not any(image.tags for image in client.images.list() if image_name in image.tags):
+        # 判断是否需要构建：强制重建，或镜像列表中找不到同名 tag。
+        # WebIDE Docker bootstrap (2026-07-07): Docker normalizes tag names to
+        # e.g. "dgm:latest", so test both the bare image name and explicit tags;
+        # otherwise every DGM run rebuilds even when the image is already reusable.
+        existing_images = client.images.list()
+        expected_tags = {image_name, f"{image_name}:latest"}
+        image_exists = any(expected_tags.intersection(set(image.tags)) for image in existing_images)
+        if force_rebuild or not image_exists:
             safe_log("Building the Docker image...")
             # rm=True：构建完成后删除中间层容器，节省磁盘空间
-            image, logs = client.images.build(path=repo_path, tag=image_name, rm=True)
+            # WebIDE Docker bootstrap (2026-07-07): this nested daemon runs with
+            # bridge networking disabled; host network keeps pip/API access working.
+            image, logs = client.images.build(path=repo_path, tag=image_name, rm=True, network_mode="host")
             for log_entry in logs:
                 if 'stream' in log_entry:
                     safe_log(log_entry['stream'].strip())
@@ -202,14 +210,16 @@ def build_dgm_container(
         else:
             safe_log(f"Docker image '{image_name}' already exists. Skipping build.")
             # 从已有镜像列表中找到目标镜像（用 next 取第一个匹配）
-            image = next((img for img in client.images.list() if image_name in img.tags), None)
+            image = next((img for img in client.images.list() if expected_tags.intersection(set(img.tags))), None)
     except Exception as e:
         safe_log(f"Error while building the Docker image: {e}")
         return None
 
     try:
         # detach=True：后台运行容器，不阻塞当前线程
-        container = client.containers.run(image=image_name, name=container_name, detach=True)
+        # WebIDE Docker bootstrap (2026-07-07): use host network because the
+        # temporary nested daemon has no bridge network/DNS, and agents need LLM API access.
+        container = client.containers.run(image=image_name, name=container_name, detach=True, network_mode="host")
         safe_log(f"Container '{container_name}' started successfully.")
         return container
     except Exception as e:

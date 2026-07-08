@@ -5,6 +5,7 @@ import anthropic
 import backoff
 import openai
 import copy
+import os
 
 from llm import create_client, get_response_from_llm
 from prompts.tooluse_prompt import get_tooluse_prompt
@@ -26,14 +27,19 @@ from tools import load_all_tools
 #   - llm_withtools.py：带工具的 agent 对话，用于 coding_agent 实际执行任务
 #
 # 关键变量：
-#   CLAUDE_MODEL：Bedrock 上的 Claude 3.5 Sonnet（工具调用强，适合编码任务）
-#   OPENAI_MODEL：o3-mini（推理强，适合多语言任务的 self_improve 模式）
+#   QWEN_MAAS_MODEL：当前链路 smoke test 使用的 Qwen3.5 397B backbone
+#   CLAUDE_MODEL / OPENAI_MODEL：保留旧名称作为兼容别名，但通过环境变量可切换
 # ============================================================
 
 
-# 两个全局模型常量：coding_agent 根据 self_improve 参数选择使用哪个
-CLAUDE_MODEL = 'bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0'
-OPENAI_MODEL = 'o3-mini-2025-01-31'
+# Model switchboard (2026-07-08): default every DGM LLM role to Qwen for the
+# current chain smoke test, but keep provider-specific model IDs configurable.
+# Set DGM_AGENT_MODEL to a Claude/Bedrock ID to re-enable native Claude tools;
+# set DGM_OPENAI_MODEL for OpenAI/o3 tie-breaker style calls when credentials exist.
+QWEN_MAAS_MODEL = os.getenv('DGM_QWEN_MODEL', 'maas/Qwen3.5-397B-A17B-FP8')
+DEFAULT_AGENT_MODEL = os.getenv('DGM_AGENT_MODEL', QWEN_MAAS_MODEL)
+CLAUDE_MODEL = os.getenv('DGM_CLAUDE_MODEL', DEFAULT_AGENT_MODEL)
+OPENAI_MODEL = os.getenv('DGM_OPENAI_MODEL', DEFAULT_AGENT_MODEL)
 
 
 def process_tool_call(tools_dict, tool_name, tool_input):
@@ -502,8 +508,11 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
 
             tool_use = check_for_tool_use(response, model=client_model)
 
-    except Exception:
-        pass
+    except Exception as e:
+        # Chain smoke setting (2026-07-07): Qwen uses the manual-tools path.
+        # Do not silently swallow missing final content or malformed tool calls;
+        # logging the exception makes end-to-end validation debuggable.
+        logging(f"Error in chat_with_agent_manualtools: {str(e)}")
 
     return new_msg_history
 

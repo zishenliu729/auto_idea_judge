@@ -35,9 +35,13 @@ if _script_dir not in sys.path:
 from judge.scorer import score_pairs_concurrent
 from judge.metrics import compute_bucket_metrics
 
-# DGM 容器内使用的默认模型（与 llm_withtools.py 中 CLAUDE_MODEL 一致）
-# 用 Bedrock 上的 Claude-3.5-Sonnet，这是 DGM 整套流程的标准工具调用模型
-DEFAULT_MODEL = "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+# Judge model switchboard (2026-07-08): default final judge backbone to Qwen
+# for controlled SoundnessBench runs, but allow SOUNDNESSBENCH_MODEL/DGM_JUDGE_MODEL
+# to switch providers without editing code. Secrets still come from environment.
+DEFAULT_MODEL = os.getenv(
+    "SOUNDNESSBENCH_MODEL",
+    os.getenv("DGM_JUDGE_MODEL", "maas/Qwen3.5-397B-A17B-FP8"),
+)
 
 # 默认数据文件：训练集小子集，供 agent 快速验证改进效果
 DEFAULT_DATA = os.path.join(_script_dir, "data", "soundnessbench_train_small.jsonl")
@@ -113,7 +117,7 @@ def main():
     )
     parser.add_argument(
         "--model", default=DEFAULT_MODEL,
-        help="调用的 LLM 模型 ID（默认：Bedrock Claude-3.5-Sonnet）"
+        help="调用的 LLM 模型 ID（默认读取 SOUNDNESSBENCH_MODEL/DGM_JUDGE_MODEL，否则 MaaS Qwen）"
     )
     parser.add_argument(
         "--mode", default="direct_bucket",

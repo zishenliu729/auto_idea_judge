@@ -8,9 +8,12 @@ from llm import create_client, get_response_from_llm, extract_json_between_marke
 from prompts.self_improvement_prompt import get_diagnose_prompt_polyglot, get_diagnose_prompt_swe, get_problem_description_prompt
 from prompts.diagnose_improvement_prompt import get_diagnose_improvement_prompt
 from prompts.testrepo_prompt import get_test_description
-from swe_bench.harness import harness
-from polyglot.harness import harness as polyglot_harness
-from swe_bench.report import make_report
+# Judge smoke fix (2026-07-07): keep SWE-bench-only imports lazy so
+# --judge can run in lightweight environments that do not install swebench.
+# run_harness_swe() imports these explicitly when the SWE path is used.
+harness = None
+make_report = None
+polyglot_harness = None
 from utils.common_utils import load_json_file
 from utils.evo_utils import get_model_patch_paths, get_all_performance, is_compiled_self_improve
 from utils.docker_utils import (
@@ -55,8 +58,18 @@ from utils.docker_utils import (
 
 # 全局数据集变量（在 self_improve 调用时初始化，避免重复加载）
 dataset = None
-# 用于诊断的高推理能力模型（o1 系列，专门用于分析和推理，不用于代码执行）
-diagnose_model = 'o1-2024-12-17'
+# Model switchboard (2026-07-08): default diagnosis to Qwen for the current
+# smoke path, but allow DGM_DIAGNOSE_MODEL or DGM_AGENT_MODEL to switch back to
+# Claude/OpenAI without editing code.
+diagnose_model = os.getenv(
+    'DGM_DIAGNOSE_MODEL',
+    os.getenv('DGM_AGENT_MODEL', 'maas/Qwen3.5-397B-A17B-FP8'),
+)
+
+
+def _compact_env(env_vars):
+    """Drop unset env vars before passing them into Docker exec calls."""
+    return {key: value for key, value in env_vars.items() if value is not None}
 
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False, judge=False):
@@ -251,6 +264,15 @@ def run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_di
         test_task_list (list[str] | None): 第一阶段的评估任务列表（None 时只用 entry）。
         test_task_list_more (list[str] | None): 第二阶段的评估任务列表。
     """
+    global harness, make_report
+    if harness is None or make_report is None:
+        # Judge smoke fix (2026-07-07): import SWE-only dependencies here,
+        # not at module import time, so judge mode does not require swebench.
+        from swe_bench.harness import harness as _harness
+        from swe_bench.report import make_report as _make_report
+        harness = _harness
+        make_report = _make_report
+
     safe_log('Start harness')
     # 如果没有传入 test_task_list，就只评估 entry 这一个任务
     test_task_list = [entry] if test_task_list is None else test_task_list
@@ -322,6 +344,13 @@ def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, outp
 
     Args: （参数同 run_harness_swe，不再重复说明）
     """
+    global polyglot_harness
+    if polyglot_harness is None:
+        # Judge smoke fix (2026-07-07): Polyglot also imports swebench transitively,
+        # so keep it lazy for the same reason as the SWE harness above.
+        from polyglot.harness import harness as _polyglot_harness
+        polyglot_harness = _polyglot_harness
+
     safe_log('Start harness')
     test_task_list = [entry] if test_task_list is None else test_task_list
     safe_log(f'workers {min(10, len(test_task_list))}')
@@ -386,7 +415,7 @@ def _run_evaluate_in_container(container, data_path_host, output_dir, env_vars):
         "--data", container_data_path,
         "--output", container_result_path,
     ]
-    exec_result = container.exec_run(cmd, environment=env_vars, workdir="/dgm")
+    exec_result = container.exec_run(cmd, environment=_compact_env(env_vars), workdir="/dgm")
     log_container_output(exec_result)
 
     # 把结果文件取回 host
@@ -446,13 +475,25 @@ def run_harness_judge(
         exec_result = container.exec_run("rm /dgm/parent_patch.txt", workdir='/dgm')
         log_container_output(exec_result)
 
-    # 环境变量：只传 LLM 调用所需的凭证（ANTHROPIC_API_KEY 不传，因为使用 Bedrock）
+    # 环境变量：只传 LLM 调用所需的凭证。
+    # Qwen judge backbone (2026-07-07): evaluate.py now defaults to MaaS Qwen
+    # with thinking enabled, so pass MaaS credentials into the evaluation container.
     env_vars = {
         "AWS_REGION": os.getenv('AWS_REGION'),
         "AWS_REGION_NAME": os.getenv('AWS_REGION_NAME'),
         "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
         "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
         "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
+        "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
+        "MAAS_API_KEY": os.getenv('MAAS_API_KEY') or os.getenv('QWEN_API_KEY'),
+        "QWEN_API_KEY": os.getenv('QWEN_API_KEY') or os.getenv('MAAS_API_KEY'),
+        "MAAS_BASE_URL": os.getenv('MAAS_BASE_URL'),
+        "MAAS_ENABLE_THINKING": os.getenv('MAAS_ENABLE_THINKING', 'true'),
+        "MAAS_MAX_OUTPUT_TOKENS": os.getenv('MAAS_MAX_OUTPUT_TOKENS', '8192'),
+        # Model switchboard (2026-07-08): keep judge evaluation model choices
+        # configurable inside Docker, not only in the host process.
+        "DGM_JUDGE_MODEL": os.getenv('DGM_JUDGE_MODEL'),
+        "SOUNDNESSBENCH_MODEL": os.getenv('SOUNDNESSBENCH_MODEL'),
     }
 
     # 阶段一：在小集合（50条）上评估，快速筛选
@@ -679,6 +720,23 @@ def self_improve(
         "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
         "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
         "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
+        # Qwen judge backbone (2026-07-07): pass MaaS credentials into Docker
+        # for evaluate.py; secrets stay in the host environment, not in code.
+        "MAAS_API_KEY": os.getenv('MAAS_API_KEY') or os.getenv('QWEN_API_KEY'),
+        "QWEN_API_KEY": os.getenv('QWEN_API_KEY') or os.getenv('MAAS_API_KEY'),
+        "MAAS_BASE_URL": os.getenv('MAAS_BASE_URL'),
+        "MAAS_ENABLE_THINKING": os.getenv('MAAS_ENABLE_THINKING', 'true'),
+        "MAAS_MAX_OUTPUT_TOKENS": os.getenv('MAAS_MAX_OUTPUT_TOKENS', '8192'),
+        # Model switchboard (2026-07-08): pass provider/model choices into the
+        # self-improvement container so Qwen/Claude/OpenAI can be selected by env.
+        "DGM_QWEN_MODEL": os.getenv('DGM_QWEN_MODEL'),
+        "DGM_AGENT_MODEL": os.getenv('DGM_AGENT_MODEL'),
+        "DGM_CLAUDE_MODEL": os.getenv('DGM_CLAUDE_MODEL'),
+        "DGM_OPENAI_MODEL": os.getenv('DGM_OPENAI_MODEL'),
+        "DGM_DIAGNOSE_MODEL": os.getenv('DGM_DIAGNOSE_MODEL'),
+        "DGM_TIE_BREAKER_MODEL": os.getenv('DGM_TIE_BREAKER_MODEL'),
+        "DGM_JUDGE_MODEL": os.getenv('DGM_JUDGE_MODEL'),
+        "SOUNDNESSBENCH_MODEL": os.getenv('SOUNDNESSBENCH_MODEL'),
     }
     # timeout 1800 = 30 分钟；自改进不需要像 issue 修复那样花 9 小时
     # --git_dir /dgm/：agent 修改自己所在目录的代码
@@ -694,7 +752,7 @@ def self_improve(
         "--test_description", test_description,
         "--self_improve",
     ]
-    exec_result = container.exec_run(cmd, environment=env_vars, workdir='/')
+    exec_result = container.exec_run(cmd, environment=_compact_env(env_vars), workdir='/')
     log_container_output(exec_result)
 
     # 从容器取回运行日志和 model_patch.diff
@@ -749,16 +807,21 @@ def self_improve(
         except Exception as e:
             safe_log(f"Error while evaluating the self-improvement: {e}")
 
+    # P0 fix (2026-07-07): judge runs usually disable post_improve_diagnose in DGM_outer.
+    # filter_compiled() still requires metadata["is_compiled"], so write it immediately
+    # after evaluation instead of only inside the optional diagnosis block.
+    if judge:
+        perf = metadata.get('overall_performance', {})
+        metadata['is_compiled'] = perf.get('accuracy_score') is not None
+        safe_log(f"[judge] is_compiled={metadata['is_compiled']}, accuracy={perf.get('accuracy_score')}")
+
     # 可选：评估后诊断（让 o1 分析改进是否真的有效）
     if post_improve_diagnose:
         safe_log("Diagnosing the self-improvement")
         if judge:
-            # judge 模式：is_compiled 的语义改为"评估是否产出了有效的 accuracy_score"
-            # 不调用 diagnose_improvement，因为它依赖 SWE-bench 的运行日志格式
-            # Step 6 的 filter_compiled 会读这个字段，所以必须写入
-            perf = metadata.get('overall_performance', {})
-            metadata['is_compiled'] = perf.get('accuracy_score') is not None
-            safe_log(f"[judge] is_compiled={metadata['is_compiled']}, accuracy={perf.get('accuracy_score')}")
+            # P0 fix (2026-07-07): is_compiled has already been written immediately
+            # after judge evaluation; keep the optional diagnosis branch side-effect free.
+            safe_log(f"[judge] post_improve_diagnose skipped; is_compiled={metadata.get('is_compiled')}")
         else:
             metadata['is_compiled'] = is_compiled_self_improve(metadata)
             if metadata['is_compiled']:

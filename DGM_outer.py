@@ -97,10 +97,17 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False, judge=False):
     # 始终检查 output_dir/initial（archive key 固定为 'initial'），
     # 而非 output_dir/{initial_folder_name}——两者不同时会导致每次都重复覆盖
     if not prevrun_dir and not os.path.exists(os.path.join(output_dir, "initial")):
-        if os.path.exists(initial_folder_name):
+        # P0 fix (2026-07-07): an empty initial_judge/ directory is not enough.
+        # Judge mode parent selection needs initial/metadata.json with a real accuracy_score.
+        initial_metadata_path = os.path.join(initial_folder_name, "metadata.json")
+        if os.path.exists(initial_metadata_path):
             os.system(f"cp -r {initial_folder_name}/ {output_dir}/initial")
         else:
-            raise RuntimeError("Error: Need to properly configure evaluation results for the initial version.")
+            raise RuntimeError(
+                f"Error: missing {initial_metadata_path}. "
+                "For judge mode, first run evaluate.py on the judge train split and write "
+                "initial_judge/metadata.json with overall_performance.accuracy_score."
+            )
 
     return archive, start_gen_num
 
@@ -228,7 +235,8 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
         parent_commits = random.choices(commits, probabilities, k=selfimprove_size)
     elif method == 'best':
         # 直接选性能最高的版本
-        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'])
+        # P0 fix (2026-07-07): best means highest accuracy first, not ascending score.
+        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'], reverse=True)
         parent_commits = sorted_commits[:min(selfimprove_size, len(sorted_commits))]
         if len(parent_commits) < selfimprove_size:
             # 候选不足时允许重复选取
@@ -477,7 +485,8 @@ def main():
     parser.add_argument("--selfimprove_workers", type=int, default=2)
     parser.add_argument(
         "--choose_selfimproves_method", type=str, default='score_child_prop',
-        choices=['random', 'score_prop', 'score_child_prop' 'best'],
+        # P0 fix (2026-07-07): missing comma previously merged score_child_prop and best into one invalid choice.
+        choices=['random', 'score_prop', 'score_child_prop', 'best'],
     )
     parser.add_argument("--continue_from", type=str, default=None)
     parser.add_argument("--update_archive", type=str, default='keep_all', choices=['keep_better', 'keep_all'])
