@@ -112,6 +112,34 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False, judge=False):
     return archive, start_gen_num
 
 
+def _resolve_judge_data_path(data_path: str | None) -> str:
+    # Data-leakage guard helper (2026-07-08): apply the train-only default used
+    # by judge-mode DGM discovery when no explicit small split is provided.
+    return data_path or os.path.join("data", "soundnessbench_train_small.jsonl")
+
+
+def validate_judge_discovery_data_paths(args):
+    # Data-leakage guard (2026-07-08): DGM/agentic discovery may optimize prompts
+    # on train or train-derived validation slices only. The held-out
+    # SoundnessBench test split is reserved for final reporting, outside this loop.
+    if not args.judge:
+        return
+    checked_paths = [
+        ("judge_data_small", _resolve_judge_data_path(args.judge_data_small)),
+        ("judge_data_medium", args.judge_data_medium),
+    ]
+    for arg_name, data_path in checked_paths:
+        if not data_path:
+            continue
+        basename = os.path.basename(data_path).lower()
+        normalized = data_path.replace("\\", "/").lower()
+        if "soundnessbench_test" in normalized or basename in {"test.jsonl", "soundnessbench_test.jsonl"} or basename.endswith("_test.jsonl"):
+            raise ValueError(
+                f"Refusing judge discovery with held-out test data via {arg_name}={data_path}. "
+                "Use train/train-derived data for DGM selection and reserve test for final reporting."
+            )
+
+
 def any_exceeding_context_length(output_dir, commit_id, instance_ids):
     """
     检测指定版本的评估日志中是否有 issue 遇到了上下文超限错误。
@@ -509,6 +537,10 @@ def main():
                         help='judge 阶段二数据路径（None=不做阶段二）')
     args = parser.parse_args()
 
+    # Data-leakage guard (2026-07-08): judge-mode DGM is a discovery/selection
+    # loop, so it must never consume the held-out SoundnessBench test split.
+    validate_judge_discovery_data_paths(args)
+
     # 确定本次运行的 ID（新运行 = 时间戳，恢复运行 = 上次的 ID）
     if not args.continue_from:
         run_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S_%f")
@@ -619,6 +651,11 @@ def main():
                 "children": selfimprove_ids,               # 所有尝试（含失败）
                 "children_compiled": selfimprove_ids_compiled,  # 通过验证的
                 "archive": archive,                         # 更新后的档案库
+                # Data-leakage guard trace (2026-07-08): persist the exact
+                # train/train-derived discovery data used by judge-mode DGM.
+                "judge_data_small": _resolve_judge_data_path(args.judge_data_small) if args.judge else None,
+                "judge_data_medium": args.judge_data_medium if args.judge else None,
+                "data_leakage_guard": "judge discovery forbids held-out SoundnessBench test data" if args.judge else None,
             }, indent=2) + "\n")
 
 

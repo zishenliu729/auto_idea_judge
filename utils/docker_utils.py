@@ -1,5 +1,6 @@
 import io
 import logging
+import os
 import threading
 from pathlib import Path
 import tarfile
@@ -219,7 +220,21 @@ def build_dgm_container(
         # detach=True：后台运行容器，不阻塞当前线程
         # WebIDE Docker bootstrap (2026-07-07): use host network because the
         # temporary nested daemon has no bridge network/DNS, and agents need LLM API access.
-        container = client.containers.run(image=image_name, name=container_name, detach=True, network_mode="host")
+        volumes = {}
+        host_site_packages = "/usr/local/lib/python3.12/dist-packages"
+        if os.path.isdir(host_site_packages):
+            # WebIDE Docker bootstrap (2026-07-08): the imported local Python
+            # base image is intentionally slim; mount host-installed packages
+            # read-only so DGM smoke runs do not rebuild or pip-install every time.
+            volumes[host_site_packages] = {"bind": host_site_packages, "mode": "ro"}
+        container = client.containers.run(
+            image=image_name,
+            command=["tail", "-f", "/dev/null"],
+            name=container_name,
+            detach=True,
+            network_mode="host",
+            volumes=volumes or None,
+        )
         safe_log(f"Container '{container_name}' started successfully.")
         return container
     except Exception as e:

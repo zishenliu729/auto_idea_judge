@@ -22,9 +22,15 @@ WORKDIR /dgm
 COPY . .
 
 # Install Python dependencies
-# WebIDE Docker bootstrap (2026-07-07): imported Ubuntu/Python bases enforce
-# PEP 668, so allow system-site installation inside this disposable DGM image.
-RUN pip install --break-system-packages --no-cache-dir -r requirements.txt
+# WebIDE Docker bootstrap (2026-07-08): the local imported Python 3.12 base is
+# paired with a read-only host site-packages mount in utils/docker_utils.py.
+# Skip build-time pip there to avoid slow, non-reusable network installs; keep
+# normal pip behavior for standard python:3.10-slim builds outside WebIDE.
+RUN if python3 --version 2>/dev/null | grep -q "Python 3.12"; then \
+        echo "WebIDE local base detected; dependencies come from mounted host site-packages"; \
+    else \
+        pip install --break-system-packages --no-cache-dir -r requirements.txt; \
+    fi
 
 # Keep the container running by default
 CMD ["tail", "-f", "/dev/null"]

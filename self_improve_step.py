@@ -619,6 +619,15 @@ def self_improve(
     os.makedirs(output_dir, exist_ok=True)
     metadata['run_id'] = run_id
     metadata['parent_commit'] = parent_commit
+    if judge:
+        # Data-leakage guard trace (2026-07-08): child metadata records the
+        # train/train-derived split used for prompt/workflow discovery. Held-out
+        # SoundnessBench test data must be evaluated only after discovery.
+        metadata['judge_data_small'] = judge_data_small or os.path.join(
+            os.path.abspath('./'), "data", "soundnessbench_train_small.jsonl"
+        )
+        metadata['judge_data_medium'] = judge_data_medium
+        metadata['data_leakage_guard'] = 'judge discovery forbids held-out SoundnessBench test data'
     # 预加载大任务列表（judge 模式不需要此变量，仅 SWE 模式使用）
     test_task_list_big = None if judge else load_json_file("./swe_bench/subsets/big.json")
 
@@ -675,7 +684,15 @@ def self_improve(
     commit_hash = commit_output.split()[1].strip("[]")
 
     # 重新安装 requirements（父代可能修改了 requirements.txt）
-    exec_result = container.exec_run("python -m pip install -r /dgm/requirements.txt", workdir='/')
+    # WebIDE Docker bootstrap (2026-07-08): local Python 3.12 containers use
+    # read-only host site-packages mounted by utils/docker_utils.py, so skip the
+    # slow in-container pip install there; standard Docker builds still install.
+    exec_result = container.exec_run(
+        "/bin/sh -c 'if python --version 2>/dev/null | grep -q \"Python 3.12\"; then "
+        "echo \"WebIDE local base detected; skipping in-container pip install\"; "
+        "else python -m pip install -r /dgm/requirements.txt; fi'",
+        workdir='/',
+    )
     log_container_output(exec_result)
 
     # 调用 diagnose_problem：让 o1 分析日志，生成改进任务描述
@@ -708,9 +725,14 @@ def self_improve(
     safe_log("Running self-improvement")
     chat_history_file_container = "/dgm/self_evo.md"
     if judge:
-        # judge 模式告诉 agent：改进目标是 judge/ workflow，验证方式是 evaluate.py
-        # 这替换了原版的 pytest/SWE-bench 测试描述
-        test_description = "run `python /dgm/evaluate.py --data /dgm/data/soundnessbench_train_small.jsonl` to test your changes to the judge workflow"
+        # judge 模式告诉 agent：改进目标是 judge/ workflow，验证方式是 evaluate.py。
+        # Data-leakage guard (2026-07-08): show the same train/train-derived
+        # path passed to the harness, so prompt/workflow discovery cannot be
+        # nudged toward the held-out SoundnessBench test split by stale docs.
+        _agent_data_small = judge_data_small or "data/soundnessbench_train_small.jsonl"
+        if not os.path.isabs(_agent_data_small):
+            _agent_data_small = os.path.join("/dgm", _agent_data_small)
+        test_description = f"run `python /dgm/evaluate.py --data {_agent_data_small}` to test your changes to the judge workflow"
     else:
         test_description = get_test_description(swerepo=False)  # 自改进时不是修复 SWE issue
     env_vars = {

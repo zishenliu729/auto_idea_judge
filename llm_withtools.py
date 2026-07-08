@@ -171,18 +171,72 @@ def check_for_tool_use(response, model=''):
             }
 
     else:
-        # 无原生工具支持的模型，在文本响应中查找 <tool_use> 标签
+        # 无原生工具支持的模型，在文本响应中查找 <tool_use> 标签。
+        # Qwen manual-tools compatibility (2026-07-08): Qwen frequently echoes
+        # earlier tool calls before the newest one, so parse the last closed block
+        # instead of the first. This keeps Claude/o3 native-tool paths untouched.
         pattern = r'<tool_use>(.*?)</tool_use>'
-        match = re.search(pattern, response, re.DOTALL)
-        if match:
-            tool_use_str = match.group(1).strip()
+        matches = list(re.finditer(pattern, response, re.DOTALL))
+        if matches:
+            tool_use_str = matches[-1].group(1).strip()
             try:
                 # ast.literal_eval 更宽松：允许 Python 字典格式（单引号、无引号 key 等）
                 tool_use_dict = ast.literal_eval(tool_use_str)
                 if isinstance(tool_use_dict, dict) and 'tool_name' in tool_use_dict and 'tool_input' in tool_use_dict:
                     return tool_use_dict
             except Exception:
-                pass
+                # Qwen manual-tools compatibility (2026-07-08): Qwen can emit
+                # editor/edit calls with file_text as a pseudo-XML payload inside
+                # a Python-like dict. Recover only that narrow shape; malformed
+                # non-editor calls still fall through as no tool call.
+                if "'tool_name'" in tool_use_str and "editor" in tool_use_str and "file_text" in tool_use_str:
+                    command_match = re.search(r'["\x27]command["\x27]\s*:\s*["\x27]([^"\x27]+)["\x27]', tool_use_str)
+                    path_match = re.search(r'["\x27]path["\x27]\s*:\s*["\x27]([^"\x27]+)["\x27]', tool_use_str)
+                    file_text = None
+
+                    # First handle normal single-quoted payloads that close like a
+                    # Python dict. This covers shorter Qwen edit calls.
+                    single_match = re.search(
+                        r'["\x27]file_text["\x27]\s*:\s*\x27(.*)\x27\s*,?\s*\}?\s*\}?$',
+                        tool_use_str,
+                        re.DOTALL,
+                    )
+                    if single_match:
+                        file_text = single_match.group(1)
+
+                    if file_text is None:
+                        # Longer Qwen edits often end the payload with
+                        # </file_text> rather than a Python quote. Treat this as
+                        # complete only when the closing tag exists, and recover
+                        # common escapes without altering non-ASCII comments.
+                        key_pos = tool_use_str.find("'file_text'")
+                        if key_pos == -1:
+                            key_pos = tool_use_str.find('"file_text"')
+                        end_tag = tool_use_str.find('</file_text>')
+                        if key_pos != -1 and end_tag != -1:
+                            colon_pos = tool_use_str.find(':', key_pos)
+                            if colon_pos != -1 and colon_pos < end_tag:
+                                raw_payload = tool_use_str[colon_pos + 1:end_tag].lstrip()
+                                if raw_payload[:1] in {"'", '"'}:
+                                    raw_payload = raw_payload[1:]
+                                file_text = (
+                                    raw_payload
+                                    .replace('\n', chr(10))
+                                    .replace('\t', chr(9))
+                                    .replace('\"', '"')
+                                    .replace("\'", "'")
+                                )
+
+                    if command_match and path_match and file_text is not None:
+                        return {
+                            'tool_name': 'editor',
+                            'tool_input': {
+                                'command': command_match.group(1),
+                                'path': path_match.group(1),
+                                'file_text': file_text,
+                            },
+                        }
+
 
     # 没有工具调用
     return None
