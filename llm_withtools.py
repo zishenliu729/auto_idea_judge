@@ -36,7 +36,7 @@ from tools import load_all_tools
 # current chain smoke test, but keep provider-specific model IDs configurable.
 # Set DGM_AGENT_MODEL to a Claude/Bedrock ID to re-enable native Claude tools;
 # set DGM_OPENAI_MODEL for OpenAI/o3 tie-breaker style calls when credentials exist.
-QWEN_MAAS_MODEL = os.getenv('DGM_QWEN_MODEL', 'maas/Qwen3.5-397B-A17B-FP8')
+QWEN_MAAS_MODEL = os.getenv('DGM_QWEN_MODEL', 'maas/Qwen3.5-397B-A17B')
 DEFAULT_AGENT_MODEL = os.getenv('DGM_AGENT_MODEL', QWEN_MAAS_MODEL)
 CLAUDE_MODEL = os.getenv('DGM_CLAUDE_MODEL', DEFAULT_AGENT_MODEL)
 OPENAI_MODEL = os.getenv('DGM_OPENAI_MODEL', DEFAULT_AGENT_MODEL)

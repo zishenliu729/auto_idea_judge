@@ -40,7 +40,7 @@ from judge.metrics import compute_bucket_metrics
 # to switch providers without editing code. Secrets still come from environment.
 DEFAULT_MODEL = os.getenv(
     "SOUNDNESSBENCH_MODEL",
-    os.getenv("DGM_JUDGE_MODEL", "maas/Qwen3.5-397B-A17B-FP8"),
+    os.getenv("DGM_JUDGE_MODEL", "maas/Qwen3.5-397B-A17B"),
 )
 
 # 默认数据文件：训练集小子集，供 agent 快速验证改进效果

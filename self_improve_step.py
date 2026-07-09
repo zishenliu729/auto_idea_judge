@@ -63,7 +63,7 @@ dataset = None
 # Claude/OpenAI without editing code.
 diagnose_model = os.getenv(
     'DGM_DIAGNOSE_MODEL',
-    os.getenv('DGM_AGENT_MODEL', 'maas/Qwen3.5-397B-A17B-FP8'),
+    os.getenv('DGM_AGENT_MODEL', 'maas/Qwen3.5-397B-A17B'),
 )
 
 

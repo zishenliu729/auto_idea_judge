@@ -8,7 +8,7 @@ from utils.swe_log_parsers import MAP_REPO_TO_PARSER
 # ============================================================
 
 
-DEFAULT_QWEN_MODEL = 'maas/Qwen3.5-397B-A17B-FP8'
+DEFAULT_QWEN_MODEL = 'maas/Qwen3.5-397B-A17B'
 TIE_BREAKER_MODEL = os.getenv(
     'DGM_TIE_BREAKER_MODEL',
     os.getenv('DGM_OPENAI_MODEL', os.getenv('DGM_AGENT_MODEL', DEFAULT_QWEN_MODEL)),

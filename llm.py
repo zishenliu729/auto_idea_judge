@@ -64,8 +64,8 @@ AVAILABLE_LLMS = [
     "deepseek-coder",
     "deepseek-reasoner",
     # XHS MaaS Qwen judge backbone（OpenAI-compatible endpoint with api-key header）
-    "maas/Qwen3.5-397B-A17B-FP8",
-    "Qwen3.5-397B-A17B-FP8",
+    "maas/Qwen3.5-397B-A17B",
+    "Qwen3.5-397B-A17B",
 ]
 
 
@@ -129,7 +129,7 @@ def create_client(model: str):
         client_model = model.split("/", 1)[1] if model.startswith("maas/") else model
         base_url = os.getenv(
             "MAAS_BASE_URL",
-            "https://maas.devops.xiaohongshu.com/dqaservice-cmtagent-397b/v1",
+            "https://pc-agent-qwen3dot5.devops.xiaohongshu.com/v1",
         )
         api_key = os.getenv("MAAS_API_KEY") or os.getenv("QWEN_API_KEY")
         if not api_key:
